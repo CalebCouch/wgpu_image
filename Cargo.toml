@@ -1,12 +1,14 @@
 [package]
-name = "wgpu_lyon"
-version = "1.1.0"
+name = "wgpu_image"
+version = "1.0.0"
 edition = "2021"
-description = "wgpu renderer api for lyon tessellation"
+description = "wgpu renderer api for 2d images"
 license = "BSD-3-Clause"
-repository = "https://github.com/CalebCouch/wgpu_lyon.git"
+repository = "https://github.com/CalebCouch/wgpu_image.git"
 
 [dependencies]
 bytemuck = {version="1.16", features=[ "derive" ]}
+image = {version="0.25.5", default-features=false, features=["png", "jpeg"]}
+log = "0.4.25"
 lyon_tessellation = "1.0.15"
 wgpu = "22.1.0"

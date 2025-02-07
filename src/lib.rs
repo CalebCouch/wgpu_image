@@ -5,8 +5,28 @@ use wgpu::{
     COPY_BUFFER_ALIGNMENT,
     VertexBufferLayout,
     DepthStencilState,
+    TextureViewDescriptor,
+    SamplerBindingType,
+    BindingType,
+    ShaderStages,
+    BindGroupLayoutEntry,
+    TextureSampleType,
+    TextureViewDimension,
+    BindGroupLayoutDescriptor,
+    BindGroupLayout,
+    Sampler,
+    ImageDataLayout,
+    TextureDescriptor,
+    TextureAspect,
+    Origin3d,
+    ImageCopyTexture,
+    TextureUsages,
+    TextureDimension,
+    Extent3d,
+    vertex_attr_array,
     MultisampleState,
     BufferDescriptor,
+    VertexAttribute,
     RenderPipeline,
     PrimitiveState,
     VertexStepMode,
@@ -17,6 +37,7 @@ use wgpu::{
     BufferUsages,
     IndexFormat,
     VertexState,
+    BindGroup,
     RenderPass,
     Buffer,
     Device,
@@ -33,16 +54,24 @@ use lyon_tessellation::{
     VertexBuffers,
 };
 
+use image::RgbaImage;
+
+use std::collections::HashMap;
+
+type Callback = Box<dyn Fn(&mut FillBuilder) -> ((u32, u32, u32, u32), Option<RgbaImage>)>;
+type Bound = (u32, u32, u32, u32);
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DefaultVertex {
     position: [f32; 2],
-    color: [f32; 3],
+    tx: [f32; 2],
+    z: f32
 }
 
 impl DefaultVertex {
-    const ATTRIBS: [wgpu::VertexAttribute; 2] =
-        wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x3];
+    const ATTRIBS: [VertexAttribute; 3] =
+        vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32];
 }
 
 impl Vertex for DefaultVertex {
@@ -58,7 +87,7 @@ impl Vertex for DefaultVertex {
     }
 
     fn shader(device: &Device) -> ShaderModule {
-        device.create_shader_module(wgpu::include_wgsl!("default_shader.wgsl"))
+        device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"))
     }
 }
 
@@ -66,10 +95,16 @@ impl Vertex for DefaultVertex {
 pub struct DefaultVertexConstructor;
 impl FillVertexConstructor<DefaultVertex> for DefaultVertexConstructor {
     fn new_vertex(&mut self, mut vertex: FillVertex) -> DefaultVertex {
+        let attrs: [f32; 5] = vertex.interpolated_attributes().try_into()
+            .expect("Expected start(2 f32) and end(2 f32) coordinates, with a z_index(f32)");
+        let start = [attrs[0], attrs[1]];
+        let end = [attrs[2], attrs[3]];
+        let pos = vertex.position().to_array();
+        let tx = [(start[0]-pos[0])/(start[0]-end[0]), (start[1]-pos[1])/(start[1]-end[1])];
         DefaultVertex{
-            position: vertex.position().to_array(),
-            color: vertex.interpolated_attributes().try_into()
-            .expect("Expected builder attributes to be 3 f32's representing RGB color values.")
+            position: pos,
+            tx,
+            z: attrs[4]
         }
     }
 }
@@ -82,16 +117,20 @@ pub trait Vertex: Copy + bytemuck::Pod + bytemuck::Zeroable {
     fn shader(device: &Device) -> ShaderModule;
 }
 
-pub struct LyonRenderer<V: Vertex = DefaultVertex> {
+pub struct ImageRenderer<V: Vertex = DefaultVertex> {
     render_pipeline: RenderPipeline,
     vertex_buffer_size: u64,
     vertex_buffer: Buffer,
     index_buffer_size: u64,
     index_buffer: Buffer,
     lyon_buffers: VertexBuffers<V, u16>,
+    slices: Vec<(usize, usize, Bound, RgbaImage)>,
+    images: HashMap<RgbaImage, BindGroup>,
+    bind_group_layout: BindGroupLayout,
+    sampler: Sampler
 }
 
-impl<V: Vertex> LyonRenderer<V> {
+impl<V: Vertex> ImageRenderer<V> {
     /// Create all unchanging resources here.
     pub fn new(
         device: &Device,
@@ -100,8 +139,35 @@ impl<V: Vertex> LyonRenderer<V> {
         depth_stencil: Option<DepthStencilState>,
     ) -> Self {
 
+        let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor{
+            label: None,
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: TextureViewDimension::D2,
+                        sample_type: TextureSampleType::Float{filterable: true},
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ]
+        });
+
         let shader = V::shader(device);
-        let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor::default());
+        let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor{
+            label: None,
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
         let render_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
             label: None,
             layout: Some(&pipeline_layout),
@@ -142,14 +208,28 @@ impl<V: Vertex> LyonRenderer<V> {
             mapped_at_creation: false,
         });
 
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
         let lyon_buffers: VertexBuffers<V, u16> = VertexBuffers::new();
-        LyonRenderer{
+        ImageRenderer{
             render_pipeline,
             vertex_buffer_size,
             vertex_buffer,
             index_buffer_size,
             index_buffer,
             lyon_buffers,
+            slices: Vec::new(),
+            images: HashMap::new(),
+            bind_group_layout,
+            sampler
         }
     }
 
@@ -160,19 +240,30 @@ impl<V: Vertex> LyonRenderer<V> {
         device: &Device,
         queue: &Queue,
         fill_options: &FillOptions,
-        callbacks: Vec<impl Fn(&mut FillBuilder)>
+        callbacks: Vec<Callback>
     ) {
         self.lyon_buffers.clear();
 
-        let mut buffer = BuffersBuilder::new(&mut self.lyon_buffers, V::constructor());
+        self.slices = Vec::new();
+
+        let mut index = 0;
 
         let mut tessellator = FillTessellator::new();
         for callback in callbacks {
-            let mut builder = tessellator.builder_with_attributes(3, fill_options, &mut buffer);
+            let mut buffer = BuffersBuilder::new(&mut self.lyon_buffers, V::constructor());
 
-            callback(&mut builder);
+            let mut builder = tessellator.builder_with_attributes(5, fill_options, &mut buffer);
+
+            let (bounds, image) = callback(&mut builder);
+            let image = image.unwrap();
 
             builder.build().unwrap();
+
+            let buffer_len = buffer.buffers().indices.len();
+
+            self.create_bind_group(device, queue, &image);
+            self.slices.push((index, buffer_len, bounds, image));
+            index = buffer_len;
         }
 
         if self.lyon_buffers.vertices.is_empty() || self.lyon_buffers.indices.is_empty() {return;}
@@ -213,7 +304,11 @@ impl<V: Vertex> LyonRenderer<V> {
         render_pass.set_pipeline(&self.render_pipeline);
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         render_pass.set_index_buffer(self.index_buffer.slice(..), IndexFormat::Uint16);
-        render_pass.draw_indexed(0..self.lyon_buffers.indices.len() as u32, 0, 0..1);
+        for (start, end, bound, image) in &self.slices {
+            render_pass.set_bind_group(0, self.images.get(image).unwrap(), &[]);
+            render_pass.set_scissor_rect(bound.0, bound.1, bound.2, bound.3);
+            render_pass.draw_indexed(*start as u32..*end as u32, 0, 0..1);
+        }
     }
 
     fn write_buffer(queue: &Queue, buffer: &Buffer, slice: &[u8]) {
@@ -245,5 +340,67 @@ impl<V: Vertex> LyonRenderer<V> {
         buffer.slice(..).get_mapped_range_mut()[..contents.len()].copy_from_slice(contents);
         buffer.unmap();
         (buffer, size)
+    }
+
+    fn create_bind_group(&mut self, device: &Device, queue: &Queue, image: &RgbaImage) {
+        if !self.images.contains_key(image) {
+            log::warn!("Building bind group");
+            let dimensions = image.dimensions();
+            let size = Extent3d {
+                width: dimensions.0,
+                height: dimensions.1,
+                depth_or_array_layers: 1,
+            };
+
+            let texture = device.create_texture(
+                &TextureDescriptor {
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: TextureDimension::D2,
+                    format: TextureFormat::Rgba8UnormSrgb,
+                    usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                    label: None,
+                    view_formats: &[],
+                }
+            );
+
+            queue.write_texture(
+                ImageCopyTexture {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: Origin3d::ZERO,
+                    aspect: TextureAspect::All,
+                },
+                image,
+                ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * dimensions.0),
+                    rows_per_image: Some(dimensions.1),
+                },
+                size
+            );
+
+            let texture_view = texture.create_view(&TextureViewDescriptor::default());
+
+            let bind_group = device.create_bind_group(
+                &wgpu::BindGroupDescriptor {
+                    layout: &self.bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&texture_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        }
+                    ],
+                    label: None,
+                }
+            );
+
+            self.images.insert(image.clone(), bind_group);
+        }
     }
 }
