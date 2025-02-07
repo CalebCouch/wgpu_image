@@ -1,48 +1,4 @@
-use wgpu::{
-    PipelineCompilationOptions,
-    RenderPipelineDescriptor,
-    PipelineLayoutDescriptor,
-    COPY_BUFFER_ALIGNMENT,
-    VertexBufferLayout,
-    DepthStencilState,
-    TextureViewDescriptor,
-    SamplerBindingType,
-    BindingType,
-    ShaderStages,
-    BindGroupLayoutEntry,
-    TextureSampleType,
-    TextureViewDimension,
-    BindGroupLayoutDescriptor,
-    BindGroupLayout,
-    Sampler,
-    ImageDataLayout,
-    TextureDescriptor,
-    TextureAspect,
-    Origin3d,
-    ImageCopyTexture,
-    TextureUsages,
-    TextureDimension,
-    Extent3d,
-    vertex_attr_array,
-    MultisampleState,
-    BufferDescriptor,
-    VertexAttribute,
-    RenderPipeline,
-    PrimitiveState,
-    VertexStepMode,
-    FragmentState,
-    TextureFormat,
-    BufferAddress,
-    ShaderModule,
-    BufferUsages,
-    IndexFormat,
-    VertexState,
-    BindGroup,
-    RenderPass,
-    Buffer,
-    Device,
-    Queue,
-};
+use wgpu::{PipelineCompilationOptions, BindGroupLayoutDescriptor, RenderPipelineDescriptor, PipelineLayoutDescriptor, COPY_BUFFER_ALIGNMENT, TextureViewDescriptor, TextureViewDimension, BindGroupLayoutEntry, SamplerBindingType, VertexBufferLayout, vertex_attr_array, DepthStencilState, TextureSampleType, TextureDescriptor, TextureDimension, ImageCopyTexture, MultisampleState, BufferDescriptor, VertexAttribute, BindGroupLayout, ImageDataLayout, RenderPipeline, PrimitiveState, VertexStepMode, FragmentState, TextureFormat, BufferAddress, TextureUsages, TextureAspect, ShaderStages, BufferUsages, IndexFormat, VertexState, BindingType, RenderPass, BindGroup, Origin3d, Extent3d, Sampler, Buffer, Device, Queue};
 
 use lyon_tessellation::{
     FillVertexConstructor,
@@ -54,30 +10,32 @@ use lyon_tessellation::{
     VertexBuffers,
 };
 
+pub use image;
+
 use image::RgbaImage;
 
 use std::collections::HashMap;
 
-type Callback = Box<dyn Fn(&mut FillBuilder) -> ((u32, u32, u32, u32), Option<RgbaImage>)>;
 type Bound = (u32, u32, u32, u32);
+
+pub struct Image {
+    pub shape_constructor: Box<dyn Fn(&mut FillBuilder)>,
+    pub bound: Bound,
+    pub image: RgbaImage
+}
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct DefaultVertex {
+struct Vertex {
     position: [f32; 2],
     tx: [f32; 2],
     z: f32
 }
 
-impl DefaultVertex {
+impl Vertex {
     const ATTRIBS: [VertexAttribute; 3] =
         vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32];
-}
 
-impl Vertex for DefaultVertex {
-    type Constructor = DefaultVertexConstructor;
-
-    fn constructor() -> Self::Constructor {DefaultVertexConstructor}
     fn layout() -> VertexBufferLayout<'static> {
         VertexBufferLayout {
             array_stride: std::mem::size_of::<Self>() as BufferAddress,
@@ -85,23 +43,19 @@ impl Vertex for DefaultVertex {
             attributes: &Self::ATTRIBS,
         }
     }
-
-    fn shader(device: &Device) -> ShaderModule {
-        device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"))
-    }
 }
 
 #[derive(Clone)]
-pub struct DefaultVertexConstructor;
-impl FillVertexConstructor<DefaultVertex> for DefaultVertexConstructor {
-    fn new_vertex(&mut self, mut vertex: FillVertex) -> DefaultVertex {
+struct VertexConstructor;
+impl FillVertexConstructor<Vertex> for VertexConstructor {
+    fn new_vertex(&mut self, mut vertex: FillVertex) -> Vertex {
         let attrs: [f32; 5] = vertex.interpolated_attributes().try_into()
             .expect("Expected start(2 f32) and end(2 f32) coordinates, with a z_index(f32)");
         let start = [attrs[0], attrs[1]];
         let end = [attrs[2], attrs[3]];
         let pos = vertex.position().to_array();
         let tx = [(start[0]-pos[0])/(start[0]-end[0]), (start[1]-pos[1])/(start[1]-end[1])];
-        DefaultVertex{
+        Vertex{
             position: pos,
             tx,
             z: attrs[4]
@@ -109,28 +63,20 @@ impl FillVertexConstructor<DefaultVertex> for DefaultVertexConstructor {
     }
 }
 
-pub trait Vertex: Copy + bytemuck::Pod + bytemuck::Zeroable {
-    type Constructor: FillVertexConstructor<Self>;
-
-    fn constructor() -> Self::Constructor;
-    fn layout() -> VertexBufferLayout<'static>;
-    fn shader(device: &Device) -> ShaderModule;
-}
-
-pub struct ImageRenderer<V: Vertex = DefaultVertex> {
+pub struct ImageRenderer {
     render_pipeline: RenderPipeline,
     vertex_buffer_size: u64,
     vertex_buffer: Buffer,
     index_buffer_size: u64,
     index_buffer: Buffer,
-    lyon_buffers: VertexBuffers<V, u16>,
-    slices: Vec<(usize, usize, Bound, RgbaImage)>,
-    images: HashMap<RgbaImage, BindGroup>,
+    lyon_buffers: VertexBuffers<Vertex, u16>,
+    image_buffer: Vec<(usize, usize, Bound, RgbaImage)>,
+    image_cache: HashMap<RgbaImage, BindGroup>,
     bind_group_layout: BindGroupLayout,
     sampler: Sampler
 }
 
-impl<V: Vertex> ImageRenderer<V> {
+impl ImageRenderer {
     /// Create all unchanging resources here.
     pub fn new(
         device: &Device,
@@ -161,7 +107,7 @@ impl<V: Vertex> ImageRenderer<V> {
             ]
         });
 
-        let shader = V::shader(device);
+        let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
         let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor{
             label: None,
             bind_group_layouts: &[&bind_group_layout],
@@ -176,7 +122,7 @@ impl<V: Vertex> ImageRenderer<V> {
                 entry_point: "vs_main",
                 compilation_options: PipelineCompilationOptions::default(),
                 buffers: &[
-                    V::layout()
+                    Vertex::layout()
                 ]
             },
             fragment: Some(FragmentState {
@@ -194,7 +140,7 @@ impl<V: Vertex> ImageRenderer<V> {
 
         let vertex_buffer_size = Self::next_copy_buffer_size(4096);
         let vertex_buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("Lyon Vertex Buffer"),
+            label: None,
             size: vertex_buffer_size,
             usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -202,7 +148,7 @@ impl<V: Vertex> ImageRenderer<V> {
 
         let index_buffer_size = Self::next_copy_buffer_size(4096);
         let index_buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("Lyon Index Buffer"),
+            label: None,
             size: index_buffer_size,
             usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -218,7 +164,7 @@ impl<V: Vertex> ImageRenderer<V> {
             ..Default::default()
         });
 
-        let lyon_buffers: VertexBuffers<V, u16> = VertexBuffers::new();
+        let lyon_buffers: VertexBuffers<Vertex, u16> = VertexBuffers::new();
         ImageRenderer{
             render_pipeline,
             vertex_buffer_size,
@@ -226,8 +172,8 @@ impl<V: Vertex> ImageRenderer<V> {
             index_buffer_size,
             index_buffer,
             lyon_buffers,
-            slices: Vec::new(),
-            images: HashMap::new(),
+            image_buffer: Vec::new(),
+            image_cache: HashMap::new(),
             bind_group_layout,
             sampler
         }
@@ -240,29 +186,24 @@ impl<V: Vertex> ImageRenderer<V> {
         device: &Device,
         queue: &Queue,
         fill_options: &FillOptions,
-        callbacks: Vec<Callback>
+        images: Vec<Image>
     ) {
         self.lyon_buffers.clear();
-
-        self.slices = Vec::new();
+        self.image_buffer.clear();
 
         let mut index = 0;
 
         let mut tessellator = FillTessellator::new();
-        for callback in callbacks {
-            let mut buffer = BuffersBuilder::new(&mut self.lyon_buffers, V::constructor());
-
+        for image in images {
+            let mut buffer = BuffersBuilder::new(&mut self.lyon_buffers, VertexConstructor);
             let mut builder = tessellator.builder_with_attributes(5, fill_options, &mut buffer);
-
-            let (bounds, image) = callback(&mut builder);
-            let image = image.unwrap();
-
+            (image.shape_constructor)(&mut builder);
             builder.build().unwrap();
-
             let buffer_len = buffer.buffers().indices.len();
 
-            self.create_bind_group(device, queue, &image);
-            self.slices.push((index, buffer_len, bounds, image));
+            self.add_image(device, queue, &image.image);
+
+            self.image_buffer.push((index, buffer_len, image.bound, image.image));
             index = buffer_len;
         }
 
@@ -273,10 +214,7 @@ impl<V: Vertex> ImageRenderer<V> {
             Self::write_buffer(queue, &self.vertex_buffer, vertices_raw);
         } else {
             let (vertex_buffer, vertex_buffer_size) = Self::create_oversized_buffer(
-                device,
-                Some("Lyon Vertex Buffer"),
-                vertices_raw,
-                BufferUsages::VERTEX | BufferUsages::COPY_DST
+                device, None, vertices_raw, BufferUsages::VERTEX | BufferUsages::COPY_DST
             );
             self.vertex_buffer = vertex_buffer;
             self.vertex_buffer_size = vertex_buffer_size;
@@ -287,10 +225,7 @@ impl<V: Vertex> ImageRenderer<V> {
             Self::write_buffer(queue, &self.index_buffer, indices_raw);
         } else {
             let (index_buffer, index_buffer_size) = Self::create_oversized_buffer(
-                device,
-                Some("Lyon Index Buffer"),
-                indices_raw,
-                BufferUsages::INDEX | BufferUsages::COPY_DST
+                device, None, indices_raw, BufferUsages::INDEX | BufferUsages::COPY_DST
             );
             self.index_buffer = index_buffer;
             self.index_buffer_size = index_buffer_size;
@@ -304,8 +239,8 @@ impl<V: Vertex> ImageRenderer<V> {
         render_pass.set_pipeline(&self.render_pipeline);
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         render_pass.set_index_buffer(self.index_buffer.slice(..), IndexFormat::Uint16);
-        for (start, end, bound, image) in &self.slices {
-            render_pass.set_bind_group(0, self.images.get(image).unwrap(), &[]);
+        for (start, end, bound, image) in &self.image_buffer {
+            render_pass.set_bind_group(0, self.image_cache.get(image).unwrap(), &[]);
             render_pass.set_scissor_rect(bound.0, bound.1, bound.2, bound.3);
             render_pass.draw_indexed(*start as u32..*end as u32, 0, 0..1);
         }
@@ -342,10 +277,11 @@ impl<V: Vertex> ImageRenderer<V> {
         (buffer, size)
     }
 
-    fn create_bind_group(&mut self, device: &Device, queue: &Queue, image: &RgbaImage) {
-        if !self.images.contains_key(image) {
-            log::warn!("Building bind group");
-            let dimensions = image.dimensions();
+    fn add_image(&mut self, device: &Device, queue: &Queue, image: &RgbaImage) {
+        if !self.image_cache.contains_key(image) {
+            let mut dimensions = image.dimensions();
+            dimensions.0 = dimensions.0.min(dimensions.1);
+            dimensions.1 = dimensions.0.min(dimensions.1);
             let size = Extent3d {
                 width: dimensions.0,
                 height: dimensions.1,
@@ -400,7 +336,7 @@ impl<V: Vertex> ImageRenderer<V> {
                 }
             );
 
-            self.images.insert(image.clone(), bind_group);
+            self.image_cache.insert(image.clone(), bind_group);
         }
     }
 }

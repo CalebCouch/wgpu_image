@@ -1048,7 +1048,6 @@ version = "1.0.0"
 dependencies = [
  "bytemuck",
  "image",
- "log",
  "lyon_tessellation",
  "wgpu",
 ]
