@@ -1,38 +1,40 @@
-use wgpu::{PipelineCompilationOptions, BindGroupLayoutDescriptor, RenderPipelineDescriptor, PipelineLayoutDescriptor, COPY_BUFFER_ALIGNMENT, TextureViewDescriptor, TextureViewDimension, BindGroupLayoutEntry, SamplerBindingType, VertexBufferLayout, vertex_attr_array, DepthStencilState, TextureSampleType, TextureDescriptor, TextureDimension, ImageCopyTexture, MultisampleState, BufferDescriptor, VertexAttribute, BindGroupLayout, ImageDataLayout, RenderPipeline, PrimitiveState, VertexStepMode, FragmentState, TextureFormat, BufferAddress, TextureUsages, TextureAspect, ShaderStages, BufferUsages, IndexFormat, VertexState, BindingType, RenderPass, BindGroup, Origin3d, Extent3d, Sampler, Buffer, Device, Queue};
+use wgpu::{PipelineCompilationOptions, BindGroupLayoutDescriptor, RenderPipelineDescriptor, PipelineLayoutDescriptor, TextureViewDescriptor, TextureViewDimension, BindGroupLayoutEntry, SamplerBindingType, VertexBufferLayout, vertex_attr_array, DepthStencilState, TextureSampleType, TextureDescriptor, TextureDimension, ImageCopyTexture, MultisampleState, VertexAttribute, BindGroupLayout, ImageDataLayout, RenderPipeline, PrimitiveState, VertexStepMode, FragmentState, TextureFormat, BufferAddress, TextureUsages, TextureAspect, ShaderStages, BufferUsages, IndexFormat, VertexState, BindingType, RenderPass, BindGroup, Origin3d, Extent3d, Sampler, Device, Queue};
 
-use lyon_tessellation::{
-    FillVertexConstructor,
-    FillTessellator,
-    FillOptions,
-    FillBuilder,
-    FillVertex,
-    BuffersBuilder,
-    VertexBuffers,
-};
+use wgpu_dyn_buffer::{DynamicBufferDescriptor, DynamicBuffer};
+
+use cyat::{VertexBuffers, ShapeBuilder, Vertex};
 
 pub use image;
-
 use image::RgbaImage;
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+
+use std::hash::{DefaultHasher, Hasher, Hash};
+use std::sync::Arc;
 
 type Bound = (u32, u32, u32, u32);
+pub type ImageKey = u64;
 
-pub struct Image {
-    pub shape_constructor: Box<dyn Fn(&mut FillBuilder)>,
-    pub bound: Bound,
-    pub image: RgbaImage
+pub struct Image(pub ShapeBuilder<ImageAttributes>, pub Bound, pub ImageKey);
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ImageAttributes {
+    pub start: [f32; 2],
+    pub end: [f32; 2],
+    pub z: f32
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct Vertex {
+struct ImageVertex {
     position: [f32; 2],
     tx: [f32; 2],
     z: f32
 }
 
-impl Vertex {
+impl ImageVertex {
     const ATTRIBS: [VertexAttribute; 3] =
         vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32];
 
@@ -45,33 +47,130 @@ impl Vertex {
     }
 }
 
-#[derive(Clone)]
-struct VertexConstructor;
-impl FillVertexConstructor<Vertex> for VertexConstructor {
-    fn new_vertex(&mut self, mut vertex: FillVertex) -> Vertex {
-        let attrs: [f32; 5] = vertex.interpolated_attributes().try_into()
-            .expect("Expected start(2 f32) and end(2 f32) coordinates, with a z_index(f32)");
-        let start = [attrs[0], attrs[1]];
-        let end = [attrs[2], attrs[3]];
-        let pos = vertex.position().to_array();
-        let tx = [(start[0]-pos[0])/(start[0]-end[0]), (start[1]-pos[1])/(start[1]-end[1])];
-        Vertex{
+impl Vertex for ImageVertex {
+    type Attributes = ImageAttributes;
+
+    fn construct(pos: [f32; 2], a: Self::Attributes) -> ImageVertex {
+        ImageVertex{
             position: pos,
-            tx,
-            z: attrs[4]
+            tx: [(a.start[0]-pos[0])/(a.start[0]-a.end[0]), (a.start[1]-pos[1])/(a.start[1]-a.end[1])],
+            z: a.z
         }
+    }
+}
+
+#[derive(Default)]
+pub struct ImageAtlas {
+    uncached: HashMap<ImageKey, RgbaImage>,
+    cached: HashMap<ImageKey, Arc<BindGroup>>
+}
+
+impl ImageAtlas {
+    pub fn new() -> Self {
+        ImageAtlas{
+            uncached: HashMap::new(),
+            cached: HashMap::new(),
+        }
+    }
+
+    pub fn add(&mut self, image: RgbaImage) -> ImageKey {
+        let mut hasher = DefaultHasher::new();
+        image.hash(&mut hasher);
+        let key = hasher.finish();
+        self.uncached.insert(key, image);
+        key
+    }
+
+    pub fn remove(&mut self, key: &ImageKey) {
+        self.uncached.remove(key);
+        self.cached.remove(key);
+    }
+
+    pub fn contains(&self, key: &ImageKey) -> bool {
+        self.uncached.contains_key(key) || self.cached.contains_key(key)
+    }
+
+    fn prepare(
+        &mut self,
+        queue: &Queue,
+        device: &Device,
+        layout: &BindGroupLayout,
+        sampler: &Sampler
+    ) {
+        self.uncached.drain().collect::<Vec<_>>().into_iter().for_each(|(key, image)| {
+            if let Entry::Vacant(entry) = self.cached.entry(key) {
+                let mut dimensions = image.dimensions();
+                dimensions.0 = dimensions.0.min(dimensions.1);
+                dimensions.1 = dimensions.0.min(dimensions.1);
+                let size = Extent3d {
+                    width: dimensions.0,
+                    height: dimensions.1,
+                    depth_or_array_layers: 1,
+                };
+
+                let texture = device.create_texture(
+                    &TextureDescriptor {
+                        size,
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: TextureDimension::D2,
+                        format: TextureFormat::Rgba8UnormSrgb,
+                        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                        label: None,
+                        view_formats: &[],
+                    }
+                );
+
+                queue.write_texture(
+                    ImageCopyTexture {
+                        texture: &texture,
+                        mip_level: 0,
+                        origin: Origin3d::ZERO,
+                        aspect: TextureAspect::All,
+                    },
+                    &image,
+                    ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(4 * dimensions.0),
+                        rows_per_image: Some(dimensions.1),
+                    },
+                    size
+                );
+
+                let texture_view = texture.create_view(&TextureViewDescriptor::default());
+
+                let bind_group = Arc::new(device.create_bind_group(
+                    &wgpu::BindGroupDescriptor {
+                        layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(&texture_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(sampler),
+                            }
+                        ],
+                        label: None,
+                    }
+                ));
+                entry.insert(bind_group);
+            }
+        })
+    }
+
+    fn get(&self, key: &ImageKey) -> Arc<BindGroup> {
+        self.cached.get(key).expect("Image not found for ImageKey").clone()
     }
 }
 
 pub struct ImageRenderer {
     render_pipeline: RenderPipeline,
-    vertex_buffer_size: u64,
-    vertex_buffer: Buffer,
-    index_buffer_size: u64,
-    index_buffer: Buffer,
-    lyon_buffers: VertexBuffers<Vertex, u16>,
-    image_buffer: Vec<(usize, usize, Bound, RgbaImage)>,
-    image_cache: HashMap<RgbaImage, BindGroup>,
+    vertex_buffer: DynamicBuffer,
+    index_buffer: DynamicBuffer,
+    cyat_buffers: VertexBuffers<ImageVertex, u16>,
+    image_buffer: Vec<(usize, usize, Bound, Arc<BindGroup>)>,
     bind_group_layout: BindGroupLayout,
     sampler: Sampler
 }
@@ -121,9 +220,7 @@ impl ImageRenderer {
                 module: &shader,
                 entry_point: "vs_main",
                 compilation_options: PipelineCompilationOptions::default(),
-                buffers: &[
-                    Vertex::layout()
-                ]
+                buffers: &[ImageVertex::layout()]
             },
             fragment: Some(FragmentState {
                 module: &shader,
@@ -138,20 +235,14 @@ impl ImageRenderer {
             cache: None
         });
 
-        let vertex_buffer_size = Self::next_copy_buffer_size(4096);
-        let vertex_buffer = device.create_buffer(&BufferDescriptor {
+        let vertex_buffer = DynamicBuffer::new(device, &DynamicBufferDescriptor {
             label: None,
-            size: vertex_buffer_size,
             usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
         });
 
-        let index_buffer_size = Self::next_copy_buffer_size(4096);
-        let index_buffer = device.create_buffer(&BufferDescriptor {
+        let index_buffer = DynamicBuffer::new(device, &DynamicBufferDescriptor {
             label: None,
-            size: index_buffer_size,
             usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
         });
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -164,16 +255,12 @@ impl ImageRenderer {
             ..Default::default()
         });
 
-        let lyon_buffers: VertexBuffers<Vertex, u16> = VertexBuffers::new();
         ImageRenderer{
             render_pipeline,
-            vertex_buffer_size,
             vertex_buffer,
-            index_buffer_size,
             index_buffer,
-            lyon_buffers,
+            cyat_buffers: VertexBuffers::new(),
             image_buffer: Vec::new(),
-            image_cache: HashMap::new(),
             bind_group_layout,
             sampler
         }
@@ -183,160 +270,42 @@ impl ImageRenderer {
     /// used during the next render that do not already exist.
     pub fn prepare(
         &mut self,
-        device: &Device,
         queue: &Queue,
-        fill_options: &FillOptions,
+        device: &Device,
+        image_atlas: &mut ImageAtlas,
         images: Vec<Image>
     ) {
-        self.lyon_buffers.clear();
+        self.cyat_buffers.clear();
         self.image_buffer.clear();
+
+        image_atlas.prepare(queue, device, &self.bind_group_layout, &self.sampler);
 
         let mut index = 0;
 
-        let mut tessellator = FillTessellator::new();
-        for image in images {
-            let mut buffer = BuffersBuilder::new(&mut self.lyon_buffers, VertexConstructor);
-            let mut builder = tessellator.builder_with_attributes(5, fill_options, &mut buffer);
-            (image.shape_constructor)(&mut builder);
-            builder.build().unwrap();
-            let buffer_len = buffer.buffers().indices.len();
-
-            self.add_image(device, queue, &image.image);
-
-            self.image_buffer.push((index, buffer_len, image.bound, image.image));
+        for Image(shape, bound, key) in images {
+            shape.build(&mut self.cyat_buffers);
+            let buffer_len = self.cyat_buffers.indices.len();
+            self.image_buffer.push((index, buffer_len, bound, image_atlas.get(&key)));
             index = buffer_len;
         }
 
-        if self.lyon_buffers.vertices.is_empty() || self.lyon_buffers.indices.is_empty() {return;}
+        if self.cyat_buffers.vertices.is_empty() || self.cyat_buffers.indices.is_empty() {return;}
 
-        let vertices_raw = bytemuck::cast_slice(&self.lyon_buffers.vertices);
-        if self.vertex_buffer_size >= vertices_raw.len() as u64 {
-            Self::write_buffer(queue, &self.vertex_buffer, vertices_raw);
-        } else {
-            let (vertex_buffer, vertex_buffer_size) = Self::create_oversized_buffer(
-                device, None, vertices_raw, BufferUsages::VERTEX | BufferUsages::COPY_DST
-            );
-            self.vertex_buffer = vertex_buffer;
-            self.vertex_buffer_size = vertex_buffer_size;
-        }
-
-        let indices_raw = bytemuck::cast_slice(&self.lyon_buffers.indices);
-        if self.index_buffer_size >= indices_raw.len() as u64 {
-            Self::write_buffer(queue, &self.index_buffer, indices_raw);
-        } else {
-            let (index_buffer, index_buffer_size) = Self::create_oversized_buffer(
-                device, None, indices_raw, BufferUsages::INDEX | BufferUsages::COPY_DST
-            );
-            self.index_buffer = index_buffer;
-            self.index_buffer_size = index_buffer_size;
-        }
+        self.vertex_buffer.write_buffer(device, queue, bytemuck::cast_slice(&self.cyat_buffers.vertices));
+        self.index_buffer.write_buffer(device, queue, bytemuck::cast_slice(&self.cyat_buffers.indices));
     }
 
     /// Render using caller provided render pass.
     pub fn render(&self, render_pass: &mut RenderPass<'_>) {
-        if self.lyon_buffers.vertices.is_empty() || self.lyon_buffers.indices.is_empty() {return;}
+        if self.cyat_buffers.vertices.is_empty() || self.cyat_buffers.indices.is_empty() {return;}
 
         render_pass.set_pipeline(&self.render_pipeline);
-        render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-        render_pass.set_index_buffer(self.index_buffer.slice(..), IndexFormat::Uint16);
-        for (start, end, bound, image) in &self.image_buffer {
-            render_pass.set_bind_group(0, self.image_cache.get(image).unwrap(), &[]);
+        render_pass.set_vertex_buffer(0, self.vertex_buffer.as_ref().slice(..));
+        render_pass.set_index_buffer(self.index_buffer.as_ref().slice(..), IndexFormat::Uint16);
+        for (start, end, bound, bind_group) in &self.image_buffer {
+            render_pass.set_bind_group(0, bind_group, &[]);
             render_pass.set_scissor_rect(bound.0, bound.1, bound.2, bound.3);
             render_pass.draw_indexed(*start as u32..*end as u32, 0, 0..1);
-        }
-    }
-
-    fn write_buffer(queue: &Queue, buffer: &Buffer, slice: &[u8]) {
-        let pad: usize = slice.len() % 4;
-        let slice = if pad != 0 {
-            &[slice, &vec![0u8; pad]].concat()
-        } else {slice};
-        queue.write_buffer(buffer, 0, slice);
-    }
-
-    fn next_copy_buffer_size(size: u64) -> u64 {
-        let align_mask = COPY_BUFFER_ALIGNMENT - 1;
-        ((size.next_power_of_two() + align_mask) & !align_mask).max(COPY_BUFFER_ALIGNMENT)
-    }
-
-    fn create_oversized_buffer(
-        device: &Device,
-        label: Option<&str>,
-        contents: &[u8],
-        usage: BufferUsages,
-    ) -> (Buffer, u64) {
-        let size = Self::next_copy_buffer_size(contents.len() as u64);
-        let buffer = device.create_buffer(&BufferDescriptor {
-            label,
-            size,
-            usage,
-            mapped_at_creation: true,
-        });
-        buffer.slice(..).get_mapped_range_mut()[..contents.len()].copy_from_slice(contents);
-        buffer.unmap();
-        (buffer, size)
-    }
-
-    fn add_image(&mut self, device: &Device, queue: &Queue, image: &RgbaImage) {
-        if !self.image_cache.contains_key(image) {
-            let mut dimensions = image.dimensions();
-            dimensions.0 = dimensions.0.min(dimensions.1);
-            dimensions.1 = dimensions.0.min(dimensions.1);
-            let size = Extent3d {
-                width: dimensions.0,
-                height: dimensions.1,
-                depth_or_array_layers: 1,
-            };
-
-            let texture = device.create_texture(
-                &TextureDescriptor {
-                    size,
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: TextureDimension::D2,
-                    format: TextureFormat::Rgba8UnormSrgb,
-                    usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-                    label: None,
-                    view_formats: &[],
-                }
-            );
-
-            queue.write_texture(
-                ImageCopyTexture {
-                    texture: &texture,
-                    mip_level: 0,
-                    origin: Origin3d::ZERO,
-                    aspect: TextureAspect::All,
-                },
-                image,
-                ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(4 * dimensions.0),
-                    rows_per_image: Some(dimensions.1),
-                },
-                size
-            );
-
-            let texture_view = texture.create_view(&TextureViewDescriptor::default());
-
-            let bind_group = device.create_bind_group(
-                &wgpu::BindGroupDescriptor {
-                    layout: &self.bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&texture_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&self.sampler),
-                        }
-                    ],
-                    label: None,
-                }
-            );
-
-            self.image_cache.insert(image.clone(), bind_group);
         }
     }
 }

@@ -193,6 +193,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cyat"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a20e7ee406a6274ce8a27f867a09251619e165f2c3cbea2f36c54a9aa522f45"
+dependencies = [
+ "bytemuck",
+ "lyon_path",
+ "lyon_tessellation",
+]
+
+[[package]]
 name = "d3d12"
 version = "22.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1043,13 +1054,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "wgpu_dyn_buffer"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74e1115ecf4fd97cc5d5b983ee31bcf5e26a16bfdb7aecab5f9dfee4da23e2c3"
+dependencies = [
+ "wgpu",
+]
+
+[[package]]
 name = "wgpu_image"
 version = "1.0.0"
 dependencies = [
  "bytemuck",
+ "cyat",
  "image",
- "lyon_tessellation",
  "wgpu",
+ "wgpu_dyn_buffer",
 ]
 
 [[package]]
