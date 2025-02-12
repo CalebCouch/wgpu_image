@@ -1,6 +1,6 @@
 [package]
 name = "wgpu_image"
-version = "2.0.1"
+version = "2.0.2"
 edition = "2021"
 description = "wgpu renderer api for 2d images"
 license = "BSD-3-Clause"
@@ -9,6 +9,6 @@ repository = "https://github.com/CalebCouch/wgpu_image.git"
 [dependencies]
 bytemuck = {version="1.16", features=[ "derive" ]}
 image = {version="0.25.5", default-features=false, features=["png", "jpeg"]}
-wgpu = "22.1.0"
-wgpu_dyn_buffer = "1.0.0"
-cyat = "1.0.1"
+wgpu = "24.0.1"
+wgpu_dyn_buffer = "2.0.0"
+cyat = "1.0.3"

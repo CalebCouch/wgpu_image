@@ -1,4 +1,4 @@
-use wgpu::{PipelineCompilationOptions, BindGroupLayoutDescriptor, RenderPipelineDescriptor, PipelineLayoutDescriptor, TextureViewDescriptor, TextureViewDimension, BindGroupLayoutEntry, SamplerBindingType, VertexBufferLayout, vertex_attr_array, DepthStencilState, TextureSampleType, TextureDescriptor, TextureDimension, ImageCopyTexture, MultisampleState, VertexAttribute, BindGroupLayout, ImageDataLayout, RenderPipeline, PrimitiveState, VertexStepMode, FragmentState, TextureFormat, BufferAddress, TextureUsages, TextureAspect, ShaderStages, BufferUsages, IndexFormat, VertexState, BindingType, RenderPass, BindGroup, Origin3d, Extent3d, Sampler, Device, Queue};
+use wgpu::{PipelineCompilationOptions, BindGroupLayoutDescriptor, RenderPipelineDescriptor, PipelineLayoutDescriptor, TextureViewDescriptor, TextureViewDimension, BindGroupLayoutEntry, SamplerBindingType, VertexBufferLayout, vertex_attr_array, DepthStencilState, TextureSampleType, TextureDescriptor, TextureDimension, TexelCopyTextureInfo, MultisampleState, VertexAttribute, BindGroupLayout, TexelCopyBufferLayout, RenderPipeline, PrimitiveState, VertexStepMode, FragmentState, TextureFormat, BufferAddress, TextureUsages, TextureAspect, ShaderStages, BufferUsages, IndexFormat, VertexState, BindingType, RenderPass, BindGroup, Origin3d, Extent3d, Sampler, Device, Queue};
 
 use wgpu_dyn_buffer::{DynamicBufferDescriptor, DynamicBuffer};
 
@@ -122,14 +122,14 @@ impl ImageAtlas {
                 );
 
                 queue.write_texture(
-                    ImageCopyTexture {
+                    TexelCopyTextureInfo {
                         texture: &texture,
                         mip_level: 0,
                         origin: Origin3d::ZERO,
                         aspect: TextureAspect::All,
                     },
                     &image,
-                    ImageDataLayout {
+                    TexelCopyBufferLayout{
                         offset: 0,
                         bytes_per_row: Some(4 * dimensions.0),
                         rows_per_image: Some(dimensions.1),
@@ -218,13 +218,13 @@ impl ImageRenderer {
             layout: Some(&pipeline_layout),
             vertex: VertexState {
                 module: &shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
                 buffers: &[ImageVertex::layout()]
             },
             fragment: Some(FragmentState {
                 module: &shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
                 targets: &[Some((*texture_format).into())],
             }),
@@ -303,7 +303,7 @@ impl ImageRenderer {
         render_pass.set_vertex_buffer(0, self.vertex_buffer.as_ref().slice(..));
         render_pass.set_index_buffer(self.index_buffer.as_ref().slice(..), IndexFormat::Uint16);
         for (start, end, bound, bind_group) in &self.image_buffer {
-            render_pass.set_bind_group(0, bind_group, &[]);
+            render_pass.set_bind_group(0, Some(&**bind_group), &[]);
             render_pass.set_scissor_rect(bound.0, bound.1, bound.2, bound.3);
             render_pass.draw_indexed(*start as u32..*end as u32, 0, 0..1);
         }
